@@ -636,195 +636,211 @@ void HLKLD2402Component::loop() {
   }
 }
 
-// Add new method to parse distance data frames
 bool HLKLD2402Component::process_distance_frame_(const std::vector<uint8_t> &frame_data) {
-  // Regular distance frame processing for normal mode
-  // Ensure the frame is at least the minimum expected length
+  // Убедимся, что фрейм имеет минимальную ожидаемую длину
   if (frame_data.size() < 10) {
     ESP_LOGW(TAG, "Distance frame too short: %d bytes", frame_data.size());
     return false;
   }
-  
-  // Additional verification: double-check that this is really a distance frame
-  // by confirming the frame type byte (should be 0x83)
+
+  // Дополнительная проверка: убедимся, что это действительно фрейм расстояния
+  // по типу байта (должен быть 0x83)
   if (frame_data.size() >= 5 && frame_data[4] != DATA_FRAME_TYPE_DISTANCE) {
     ESP_LOGW(TAG, "Not a distance frame type: 0x%02X", frame_data[4]);
     return false;
   }
-  
-  // Parse the data length from the frame
-  uint16_t data_length = frame_data[6] | (frame_data[7] << 8);
-  
-  // Check if we have at least enough data for distance values
-  if (frame_data.size() < 14) {
+
+  // Извлекаем длину данных из фрейма
+  // uint16_t data_length = frame_data[6] | (frame_data[7] << 8); 
+  // (Длина может не использоваться напрямую для логики, но полезна для проверки)
+
+  // Убедимся, что в фрейме достаточно данных для значений расстояния
+  if (frame_data.size() < 14) { 
     ESP_LOGW(TAG, "Frame too short to contain distance data");
     return false;
   }
+
+  // НАЧАЛО ИСПРАВЛЕНИЯ ЛОГИКИ
+  // Вместо интерпретации сырых значений как расстояния,
+  // мы находим первый (ближайший) ворот с ненулевой энергией.
+  // Расстояние рассчитывается как номер ворота * размер ворота (0.7м).
   
-  // We'll use the first non-zero value as our distance
-  float min_distance_cm = 0;
-  
-  // Start at byte 13 (index 12) and look for the first valid distance
-  for (size_t i = 12; i + 3 < frame_data.size(); i += 4) {
-    uint32_t value = frame_data[i] | 
-                    (frame_data[i+1] << 8) | 
-                    (frame_data[i+2] << 16) | 
-                    (frame_data[i+3] << 24);
-                    
-    // If the value is non-zero, convert to distance
-    if (value > 0) {
-      float distance = value * 0.1f; // Convert to cm
+  float detected_distance_cm = 0.0f; // Инициализируем как "не обнаружено"
+  const size_t energy_start_offset = 13; // Начало данных энергии
+  const float gate_size_cm = DISTANCE_GATE_SIZE * 100.0f; // 0.7 м = 70 см
+  const uint8_t max_gates = DEFAULT_GATES; // Используем константу из заголовка
+
+  for (uint8_t gate = 0; gate < max_gates; ++gate) {
+    size_t offset = energy_start_offset + (gate * 4);
+    // Проверяем, достаточно ли данных во фрейме
+    if (offset + 3 >= frame_data.size()) {
+       ESP_LOGW(TAG, "Frame truncated while reading gate %d energy", gate);
+       break; 
+    }
+
+    // Извлекаем 32-битное значение энергии (little-endian)
+    uint32_t raw_energy = frame_data[offset] | 
+                         (frame_data[offset+1] << 8) | 
+                         (frame_data[offset+2] << 16) | 
+                         (frame_data[offset+3] << 24);
+
+    // Если энергия больше 0, считаем, что цель обнаружена в этом вороте
+    if (raw_energy > 0) {
+      // Расстояние до центра ворот
+      // gate * gate_size_cm дает расстояние до начала ворота
+      // gate_size_cm * 0.5f добавляет половину размера ворота, чтобы получить центр
+      detected_distance_cm = (gate * gate_size_cm) + (gate_size_cm * 0.5f); 
       
-      // If this is the first valid value, or it's closer than our current minimum
-      if (min_distance_cm == 0 || distance < min_distance_cm) {
-        min_distance_cm = distance;
+      // Определяем статус обнаружения на основе значения энергии
+      // Простая эвристика: если энергия очень высокая, это может быть статический объект
+      // Это приблизительная логика, точные пороги могут потребовать настройки
+      uint8_t detection_status = 1; // 1 = человек (движется)
+      // if (raw_energy > очень_высокий_порог) detection_status = 2; // 2 = статический человек
+      // else if (raw_energy > высокий_порог) detection_status = 1; // 1 = человек
+      // else detection_status = 0; // 0 = нет (или очень слабый сигнал)
+
+      const char* status_text = "unknown";
+      switch(detection_status) {
+        case 0: status_text = "no person"; break;
+        case 1: status_text = "person"; break;
+        case 2: status_text = "stationary person"; break;
       }
+
+      // Всегда обновляем бинарные сенсоры
+      update_binary_sensors_(detected_distance_cm);
+
+      // Проверяем троттлинг для сенсора расстояния
+      uint32_t now = millis();
+      bool throttled = (this->distance_sensor_ != nullptr && 
+                       now - last_distance_update_ < distance_throttle_ms_);
       
-      ESP_LOGV(TAG, "Distance value at pos %d: %.1f cm", i, distance);
-      
-      // Find just one valid value, then break
-      if (min_distance_cm > 0) {
-        break;
+      // Обновляем сенсор расстояния, если не троттлим
+      if (!throttled && this->distance_sensor_ != nullptr) {
+        static float last_reported_distance = -1.0f; // Инициализируем недопустимым значением
+        bool significant_change = (last_reported_distance < 0) || 
+                                  (fabsf(detected_distance_cm - last_reported_distance) > 10.0f); // Изменение > 10см
+        if (significant_change) {
+          ESP_LOGI(TAG, "Detected %s at distance (frame): %.1f cm (gate %d)", status_text, detected_distance_cm, gate);
+          last_reported_distance = detected_distance_cm;
+        } else {
+          ESP_LOGV(TAG, "Detected %s at distance (frame): %.1f cm (gate %d)", status_text, detected_distance_cm, gate);
+        }
+        this->distance_sensor_->publish_state(detected_distance_cm);
+        last_distance_update_ = now;
+        ESP_LOGD(TAG, "Updated distance sensor to %.1f cm", detected_distance_cm);
       }
+      // Найдено первое (ближайшее) обнаружение, выходим из цикла
+      return true; 
     }
   }
-  
-  // If we found a valid distance
-  if (min_distance_cm > 0) {
-    // Extract the detection status from the frame data
-    uint8_t detection_status = 0;
-    if (frame_data.size() >= 9) {
-      detection_status = frame_data[8];
-    }
-    
-    // Log with more detailed status information
-    const char* status_text = "unknown";
-    switch(detection_status) {
-      case 0: status_text = "no person"; break;
-      case 1: status_text = "person"; break;
-      case 2: status_text = "stationary person"; break;
-    }
-    
-    // Always update binary sensors (no throttling needed)
-    update_binary_sensors_(min_distance_cm);
-    
-    // For distance sensor, check throttling
-    uint32_t now = millis();
-    bool throttled = (this->distance_sensor_ != nullptr && 
-                     now - last_distance_update_ < distance_throttle_ms_);
-    
-    // Only update distance sensor if not throttled
-    if (!throttled && this->distance_sensor_ != nullptr) {
-      static float last_reported_distance = 0;
-      bool significant_change = fabsf(min_distance_cm - last_reported_distance) > 10.0f;
-      
-      if (significant_change) {
-        ESP_LOGI(TAG, "Detected %s at distance (binary): %.1f cm", status_text, min_distance_cm);
-        last_reported_distance = min_distance_cm;
-      } else {
-        ESP_LOGV(TAG, "Detected %s at distance (binary): %.1f cm", status_text, min_distance_cm);
-      }
-      
-      this->distance_sensor_->publish_state(min_distance_cm);
-      last_distance_update_ = now;
-      ESP_LOGD(TAG, "Updated distance sensor");
-    }
-    
-    return true;
+
+  // Если мы дошли до этого места, значит энергия во всех воротах была 0
+  // Это означает "OFF" состояние
+  ESP_LOGI(TAG, "No target detected (all gates zero energy)");
+  if (this->presence_binary_sensor_ != nullptr) {
+    this->presence_binary_sensor_->publish_state(false);
   }
-  
-  return false;  // No valid distance found
+  if (this->micromovement_binary_sensor_ != nullptr) {
+    this->micromovement_binary_sensor_->publish_state(false);
+  }
+  // Обновляем сенсор расстояния до 0, если не троттлим
+  uint32_t now = millis();
+  bool throttled = (this->distance_sensor_ != nullptr && 
+                   now - last_distance_update_ < distance_throttle_ms_);
+  if (!throttled && this->distance_sensor_ != nullptr) {
+    this->distance_sensor_->publish_state(0);
+    last_distance_update_ = now; 
+  }
+  return true; // Фрейм обработан успешно, просто цель не обнаружена
 }
 
 // Add new method to process engineering data from 0x83 frames
+// Исправленная функция для обработки инженерных данных из фрейма 0x83 в инженерном режиме
 bool HLKLD2402Component::process_engineering_from_distance_frame_(const std::vector<uint8_t> &frame_data) {
-  // Early exit if engineering data processing is not enabled
+  // Ранний выход, если обработка инженерных данных отключена
   if (!engineering_data_enabled_) {
     ESP_LOGD(TAG, "Engineering data processing disabled");
     return false;
   }
-  
   if (energy_gate_sensors_.empty()) {
     ESP_LOGD(TAG, "No energy gate sensors configured");
     return false;
   }
-  
-  // Ensure the frame is at least the minimum expected length
-  // Header (5) + Length (2) + Some data
+
+  // Убедимся, что фрейм имеет минимальную ожидаемую длину
   if (frame_data.size() < 10) {
     ESP_LOGW(TAG, "Engineering frame too short: %d bytes", frame_data.size());
     return false;
   }
-  
-  // Check throttling - only log and update sensors if enough time has passed
+
+  // Проверяем троттлинг - логируем и обновляем сенсоры, только если прошло достаточно времени
   uint32_t now = millis();
   bool throttled = (now - last_engineering_update_ < engineering_throttle_ms_);
-  
   if (!throttled) {
-    // Only log the frame when not throttled
+    // Логируем фрейм только если не троттлим
     char hex_buf[256] = {0};
     for (size_t i = 0; i < std::min(frame_data.size(), size_t(50)); i++) {
       sprintf(hex_buf + (i*3), "%02X ", frame_data[i]);
     }
     ESP_LOGI(TAG, "Processing 0x83 frame as engineering data: %s", hex_buf);
   }
-  
-  // For 0x83 frames in engineering mode, the energy values start at byte 13
-  // Energy values are the same values that would be "distance" in normal mode
-  const size_t motion_energy_start = 13;  // Start offset for energy values
-  const size_t motion_gate_count = DEFAULT_GATES;    // Should use DEFAULT_GATES for consistency
-  
-  // Ensure we have enough data
+
+  // Для фреймов 0x83 в инженерном режиме, значения энергии начинаются с байта 13
+  const size_t motion_energy_start = 13;  
+  const size_t motion_gate_count = DEFAULT_GATES;    
+
+  // Убедимся, что в фрейме достаточно данных
   if (frame_data.size() < motion_energy_start + 4) {
     ESP_LOGW(TAG, "Frame too short for energy data");
     return false;
   }
-  
-  // Process each gate's energy value
+
+  // Обрабатываем значение энергии для каждого ворота
   for (uint8_t i = 0; i < motion_gate_count; i++) {
     size_t offset = motion_energy_start + (i * 4);
-    
-    // Make sure we have enough data for this gate
+    // Убедимся, что в фрейме достаточно данных для этого ворота
     if (offset + 3 >= frame_data.size()) {
       ESP_LOGW(TAG, "Engineering frame truncated at gate %d", i);
       break;
     }
-    
-    // Extract 32-bit energy value (little-endian)
+    // Извлекаем 32-битное значение энергии (little-endian)
     uint32_t raw_energy = frame_data[offset] | 
                         (frame_data[offset+1] << 8) | 
                         (frame_data[offset+2] << 16) | 
                         (frame_data[offset+3] << 24);
     
-    // Convert raw energy to dB as per manual: dB = 10 * log10(raw_value)
-    // Only calculate for non-zero values to avoid log(0)
-    float db_energy = 0;
+    // КОНЦЕ ИСПРАВЛЕНИЯ ЛОГИКИ
+    // Конвертируем сырую энергию в децибелы, как указано в руководстве:
+    // dB = 10 * log10(raw_value)
+    // Только вычисляем для ненулевых значений, чтобы избежать log(0)
+    float db_energy = 0.0f;
     if (raw_energy > 0) {
-      db_energy = 10.0f * log10f(raw_energy);
+      db_energy = 10.0f * log10f(static_cast<float>(raw_energy));
+    } else {
+       // Если энергия 0, устанавливаем очень низкое значение dB (или 0)
+       // db_energy = 0.0f; // Или можно использовать специальное значение, если нужно
     }
-    
-    // Calculate approximate distance for this gate
+
+    // Рассчитываем приблизительное расстояние для этого ворота (для информации)
     float gate_start_distance = i * DISTANCE_GATE_SIZE;
     float gate_end_distance = gate_start_distance + DISTANCE_GATE_SIZE;
-    
-    // Update sensor if configured for this gate and not throttled
+    float gate_center_distance = gate_start_distance + (DISTANCE_GATE_SIZE / 2.0f);
+
+    // Обновляем сенсор, если он сконфигурирован для этого ворота и не троттлим
     if (!throttled && i < energy_gate_sensors_.size() && energy_gate_sensors_[i] != nullptr) {
-      energy_gate_sensors_[i]->publish_state(db_energy);
-      
-      // Only log gate data when not throttled
-      ESP_LOGI(TAG, "Gate %d (%.1f-%.1f m) energy: %.1f dB (raw: %u)", 
-              i, gate_start_distance, gate_end_distance, db_energy, raw_energy);
+      energy_gate_sensors_[i]->publish_state(db_energy); // Публикуем значение в dB
+      // Логируем данные ворота только если не троттлим
+      ESP_LOGI(TAG, "Gate %d (%.1f-%.1f m, center %.1f m) energy: %.1f dB (raw: %u)", 
+              i, gate_start_distance, gate_end_distance, gate_center_distance, db_energy, raw_energy);
     }
   }
-  
-  // Update the throttle timestamp if we weren't throttled
+
+  // Обновляем временную метку троттлинга, если мы не троттлили
   if (!throttled) {
     last_engineering_update_ = now;
   }
-  
   return true;
 }
-
 // Add new method to process engineering data
 bool HLKLD2402Component::process_engineering_data_(const std::vector<uint8_t> &frame_data) {
   // Early exit if engineering data processing is not enabled
